@@ -1,0 +1,20 @@
+# Binaries
+bin/
+
+# Build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# IDE/editor directories
+.idea/
+.vscode/
+*.swp
+
+# Dependency directories
+vendor/
+
+# macOS
+.DS_Store
