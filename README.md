@@ -21,7 +21,7 @@
 ## 📦 **安装**
 
 ```bash
-go get github.com/apaas/apaas-sdk/go-client/apaas
+go get github.com/ennann/apaas-oapi-go-client/apaas
 ```
 
 ---
@@ -35,7 +35,7 @@ import (
     "context"
     "log"
 
-    "github.com/apaas/apaas-sdk/go-client/apaas"
+    "github.com/ennann/apaas-oapi-go-client/apaas"
 )
 
 func main() {

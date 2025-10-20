@@ -1,4 +1,4 @@
-module github.com/apaas/apaas-sdk/go-client
+module github.com/ennann/apaas-oapi-go-client
 
 go 1.21
 

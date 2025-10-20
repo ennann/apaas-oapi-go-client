@@ -5,7 +5,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/apaas/apaas-sdk/go-client/apaas"
+	"github.com/ennann/apaas-oapi-go-client/apaas"
 )
 
 func main() {

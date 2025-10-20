@@ -21,7 +21,7 @@ aPaaS 平台有完整的 Open API 能力，但是目前这些能力全都以单�
 **📦 安装**
 
 ```bash
-go get github.com/apaas/apaas-sdk/go-client/apaas
+go get github.com/ennann/apaas-oapi-go-client/apaas
 ```
 
 ***
@@ -37,7 +37,7 @@ import (
 	"context"
 	"log"
 
-	"github.com/apaas/apaas-sdk/go-client/apaas"
+	"github.com/ennann/apaas-oapi-go-client/apaas"
 )
 
 func main() {
