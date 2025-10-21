@@ -480,18 +480,25 @@ func (s *ObjectUpdateService) Record(ctx context.Context, params ObjectUpdateRec
 
 // Records updates up to 100 records.
 func (s *ObjectUpdateService) Records(ctx context.Context, params ObjectUpdateRecordsParams) (*APIResponse, error) {
-	if err := s.client.ensureTokenValid(ctx); err != nil {
-		return nil, err
-	}
+	s.client.log(LoggerLevelInfo, "[object.update.records] Updating %d records", len(params.Records))
 
-	endpoint := fmt.Sprintf(
-		"/v1/data/namespaces/%s/objects/%s/records/records_batch",
-		url.PathEscape(s.client.namespace),
-		url.PathEscape(params.ObjectName),
-	)
+	var resp *APIResponse
+	err := s.client.limiter.Do(ctx, func() error {
+		if err := s.client.ensureTokenValid(ctx); err != nil {
+			return err
+		}
 
-	payload := map[string]any{"records": params.Records}
-	resp, err := s.client.doJSON(ctx, http.MethodPatch, endpoint, payload, true, nil)
+		endpoint := fmt.Sprintf(
+			"/v1/data/namespaces/%s/objects/%s/records_batch",
+			url.PathEscape(s.client.namespace),
+			url.PathEscape(params.ObjectName),
+		)
+
+		payload := map[string]any{"records": params.Records}
+		var err error
+		resp, err = s.client.doJSON(ctx, http.MethodPatch, endpoint, payload, true, nil)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
