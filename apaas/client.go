@@ -25,6 +25,7 @@ type ClientOptions struct {
 	HTTPClient        *http.Client
 	Logger            Logger
 	LimiterOptions    *LimiterOptions
+	RetryConfig       *RetryConfig
 }
 
 // Client wraps HTTP access to the aPaaS OpenAPI.
@@ -39,11 +40,14 @@ type Client struct {
 
 	logger Logger
 
-	tokenMu     sync.RWMutex
-	accessToken string
-	expireTime  time.Time
+	tokenMu         sync.RWMutex
+	accessToken     string
+	expireTime      time.Time
+	tokenRefreshing bool // Flag to prevent concurrent token refreshes
 
 	limiter *RateLimiter
+
+	retryConfig RetryConfig
 
 	// Service groups
 	Object     *ObjectService
@@ -94,6 +98,11 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		limiterOpts = *opts.LimiterOptions
 	}
 
+	retryConfig := DefaultRetryConfig()
+	if opts.RetryConfig != nil {
+		retryConfig = *opts.RetryConfig
+	}
+
 	client := &Client{
 		clientID:          opts.ClientID,
 		clientSecret:      opts.ClientSecret,
@@ -103,6 +112,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		baseURL:           parsedBase,
 		logger:            logger,
 		limiter:           NewRateLimiter(limiterOpts),
+		retryConfig:       retryConfig,
 	}
 
 	client.Object = newObjectService(client)
@@ -172,9 +182,22 @@ func (c *Client) ensureTokenValid(ctx context.Context) error {
 
 	c.tokenMu.RLock()
 	tokenValid := c.accessToken != "" && time.Until(c.expireTime) > time.Minute
+	tokenRefreshing := c.tokenRefreshing
 	c.tokenMu.RUnlock()
+
 	if tokenValid {
 		return nil
+	}
+
+	// If another goroutine is already refreshing, wait for it
+	if tokenRefreshing {
+		time.Sleep(50 * time.Millisecond)
+		c.tokenMu.RLock()
+		tokenValid = c.accessToken != "" && time.Until(c.expireTime) > time.Minute
+		c.tokenMu.RUnlock()
+		if tokenValid {
+			return nil
+		}
 	}
 
 	c.tokenMu.Lock()
@@ -184,6 +207,12 @@ func (c *Client) ensureTokenValid(ctx context.Context) error {
 	if c.accessToken != "" && time.Until(c.expireTime) > time.Minute {
 		return nil
 	}
+
+	// Set flag to indicate token refresh is in progress
+	c.tokenRefreshing = true
+	defer func() {
+		c.tokenRefreshing = false
+	}()
 
 	return c.refreshAccessTokenLocked(ctx)
 }
@@ -252,20 +281,58 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body any, auth
 		headers["Accept"] = "application/json"
 	}
 
-	resp, err := c.doRequestRaw(ctx, method, path, reader, headers, auth)
-	if err != nil {
-		return nil, err
+	var resp *http.Response
+	var err error
+
+	// Execute with retry logic
+	retryErr := Retry(ctx, c.retryConfig, func() error {
+		resp, err = c.doRequestRaw(ctx, method, path, reader, headers, auth)
+		if err != nil {
+			return &NetworkError{Operation: "http request", Err: err}
+		}
+
+		// Check for retryable HTTP status codes
+		if resp.StatusCode == http.StatusTooManyRequests ||
+			resp.StatusCode == http.StatusInternalServerError ||
+			resp.StatusCode == http.StatusBadGateway ||
+			resp.StatusCode == http.StatusServiceUnavailable ||
+			resp.StatusCode == http.StatusGatewayTimeout {
+			defer resp.Body.Close()
+			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			return newAPIError(resp.StatusCode, "", string(bodyBytes), method, path, nil)
+		}
+
+		return nil
+	})
+
+	if retryErr != nil {
+		return nil, retryErr
 	}
+
 	defer resp.Body.Close()
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("api request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+		return nil, newAPIError(resp.StatusCode, "", string(bodyBytes), method, path, nil)
 	}
 
 	var apiResp APIResponse
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
 		return nil, fmt.Errorf("failed to decode API response: %w", err)
+	}
+
+	// Check for API-level errors
+	if apiResp.Code != "0" && apiResp.Code != "" {
+		requestID := resp.Header.Get("X-Request-Id")
+		apiErr := &APIError{
+			StatusCode: resp.StatusCode,
+			Code:       apiResp.Code,
+			Message:    apiResp.Msg,
+			RequestID:  requestID,
+			Method:     method,
+			Endpoint:   path,
+		}
+		c.log(LoggerLevelWarn, "[client] API error: %v", apiErr)
 	}
 
 	return &apiResp, nil
