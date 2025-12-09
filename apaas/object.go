@@ -101,6 +101,7 @@ type ObjectCreateRecordsParams struct {
 type ObjectCreateRecordsIteratorParams struct {
 	ObjectName string
 	Records    []map[string]any
+	Limit      int // 每批次数量，默认 100
 }
 
 // ObjectUpdateService updates records.
@@ -125,6 +126,7 @@ type ObjectUpdateRecordsParams struct {
 type ObjectUpdateRecordsIteratorParams struct {
 	ObjectName string
 	Records    []map[string]any
+	Limit      int // 每批次数量，默认 100
 }
 
 // ObjectDeleteService deletes records.
@@ -148,6 +150,7 @@ type ObjectDeleteRecordsParams struct {
 type ObjectDeleteRecordsIteratorParams struct {
 	ObjectName string
 	IDs        []string
+	Limit      int // 每批次数量，默认 100
 }
 
 // List returns available objects (data tables).
@@ -397,18 +400,33 @@ func (s *ObjectCreateService) Records(ctx context.Context, params ObjectCreateRe
 }
 
 // RecordsWithIterator creates records in batches of 100.
-func (s *ObjectCreateService) RecordsWithIterator(ctx context.Context, params ObjectCreateRecordsIteratorParams) (*RecordsIteratorResult, error) {
+func (s *ObjectCreateService) RecordsWithIterator(ctx context.Context, params ObjectCreateRecordsIteratorParams) (*BatchOperationResult, error) {
 	total := len(params.Records)
-	result := &RecordsIteratorResult{
-		Total: total,
-		Items: make([]map[string]any, 0, total),
+
+	// 参数校验
+	if params.Records == nil {
+		s.client.log(LoggerLevelError, "[object.create.recordsWithIterator] Invalid records parameter: must be a non-empty array")
+		return nil, fmt.Errorf("参数 records 必须是一个数组")
 	}
 
 	if total == 0 {
-		return result, nil
+		s.client.log(LoggerLevelWarn, "[object.create.recordsWithIterator] Empty records array provided, returning empty result")
+		return &BatchOperationResult{Total: 0, Success: []OperationItem{}, Failed: []OperationItem{}, SuccessCount: 0, FailedCount: 0}, nil
 	}
 
-	const chunkSize = 100
+	chunkSize := params.Limit
+	if chunkSize <= 0 {
+		chunkSize = 100
+	}
+
+	result := &BatchOperationResult{
+		Total:   total,
+		Success: make([]OperationItem, 0, total),
+		Failed:  make([]OperationItem, 0),
+	}
+
+	s.client.log(LoggerLevelDebug, "[object.create.recordsWithIterator] Chunking %d records into groups of %d", total, chunkSize)
+
 	for index := 0; index < total; index += chunkSize {
 		end := index + chunkSize
 		if end > total {
@@ -417,33 +435,145 @@ func (s *ObjectCreateService) RecordsWithIterator(ctx context.Context, params Ob
 		chunk := params.Records[index:end]
 		chunkIndex := index/chunkSize + 1
 
-		s.client.log(LoggerLevelInfo, "[object.create.recordsWithIterator] Processing chunk %d/%d: %d records", chunkIndex, (total+chunkSize-1)/chunkSize, len(chunk))
+		s.client.log(LoggerLevelDebug, "[object.create.recordsWithIterator] Processing chunk %d/%d: %d records", chunkIndex, (total+chunkSize-1)/chunkSize, len(chunk))
 
-		var resp *APIResponse
 		err := s.client.limiter.Do(ctx, func() error {
-			var err error
-			resp, err = s.Records(ctx, ObjectCreateRecordsParams{
+			resp, err := s.Records(ctx, ObjectCreateRecordsParams{
 				ObjectName: params.ObjectName,
 				Records:    chunk,
 			})
-			return err
+
+			if err != nil {
+				s.client.log(LoggerLevelError, "[object.create.recordsWithIterator] Chunk %d threw error: %v", chunkIndex, err)
+				// 整个批次异常，将这批次的所有记录标记为失败
+				for _, record := range chunk {
+					id := "unknown"
+					if idVal, ok := record["_id"]; ok {
+						if idStr, ok := idVal.(string); ok {
+							id = idStr
+						}
+					}
+					result.Failed = append(result.Failed, OperationItem{
+						ID:      id,
+						Success: false,
+						Error:   err.Error(),
+					})
+				}
+				return nil // 继续处理下一批次
+			}
+
+			if resp.Code != "0" {
+				s.client.log(LoggerLevelError, "[object.create.recordsWithIterator] Chunk %d failed: code=%s, msg=%s", chunkIndex, resp.Code, resp.Msg)
+				// 整个批次失败，将这批次的所有记录标记为失败
+				for _, record := range chunk {
+					id := "unknown"
+					if idVal, ok := record["_id"]; ok {
+						if idStr, ok := idVal.(string); ok {
+							id = idStr
+						}
+					}
+					errMsg := resp.Msg
+					if errMsg == "" {
+						errMsg = fmt.Sprintf("Creation failed with code %s", resp.Code)
+					}
+					result.Failed = append(result.Failed, OperationItem{
+						ID:      id,
+						Success: false,
+						Error:   errMsg,
+					})
+				}
+				return nil // 继续处理下一批次
+			}
+
+			// 处理响应中的 items
+			var page struct {
+				Items []map[string]any `json:"items"`
+			}
+			if err := resp.DecodeData(&page); err != nil {
+				s.client.log(LoggerLevelError, "[object.create.recordsWithIterator] Failed to decode batch create response: %v", err)
+				for _, record := range chunk {
+					id := "unknown"
+					if idVal, ok := record["_id"]; ok {
+						if idStr, ok := idVal.(string); ok {
+							id = idStr
+						}
+					}
+					result.Failed = append(result.Failed, OperationItem{
+						ID:      id,
+						Success: false,
+						Error:   err.Error(),
+					})
+				}
+				return nil
+			}
+
+			if len(page.Items) > 0 {
+				for _, item := range page.Items {
+					id := "unknown"
+					if idVal, ok := item["_id"]; ok {
+						if idStr, ok := idVal.(string); ok {
+							id = idStr
+						}
+					}
+
+					// Check success field - if not present or not false, treat as success
+					success := true
+					if successVal, ok := item["success"]; ok {
+						if successBool, ok := successVal.(bool); ok {
+							success = successBool
+						}
+					}
+
+					if success {
+						result.Success = append(result.Success, OperationItem{
+							ID:      id,
+							Success: true,
+						})
+					} else {
+						errMsg := ""
+						if errorVal, ok := item["error"]; ok {
+							if errorStr, ok := errorVal.(string); ok {
+								errMsg = errorStr
+							}
+						}
+						result.Failed = append(result.Failed, OperationItem{
+							ID:      id,
+							Success: false,
+							Error:   errMsg,
+						})
+					}
+				}
+			}
+
+			successCount := 0
+			failedCount := 0
+			for _, item := range page.Items {
+				if successVal, ok := item["success"]; ok {
+					if successBool, ok := successVal.(bool); ok && !successBool {
+						failedCount++
+					} else {
+						successCount++
+					}
+				} else {
+					successCount++
+				}
+			}
+
+			s.client.log(LoggerLevelInfo, "[object.create.recordsWithIterator] Chunk %d completed: %s, success=%d, failed=%d", chunkIndex, params.ObjectName, successCount, failedCount)
+			s.client.log(LoggerLevelTrace, "[object.create.recordsWithIterator] Chunk %d response: %+v", chunkIndex, resp)
+
+			return nil
 		})
+
 		if err != nil {
 			return nil, err
 		}
-
-		var page struct {
-			Items []map[string]any `json:"items"`
-		}
-		if err := resp.DecodeData(&page); err != nil {
-			return nil, fmt.Errorf("failed to decode batch create response: %w", err)
-		}
-		if len(page.Items) > 0 {
-			result.Items = append(result.Items, page.Items...)
-		}
-
-		s.client.log(LoggerLevelDebug, "[object.create.recordsWithIterator] Chunk %d completed: created=%d", chunkIndex, len(page.Items))
 	}
+
+	result.SuccessCount = len(result.Success)
+	result.FailedCount = len(result.Failed)
+
+	s.client.log(LoggerLevelInfo, "[object.create.recordsWithIterator] Create completed: total=%d, success=%d, failed=%d", result.Total, result.SuccessCount, result.FailedCount)
 
 	return result, nil
 }
@@ -508,15 +638,33 @@ func (s *ObjectUpdateService) Records(ctx context.Context, params ObjectUpdateRe
 }
 
 // RecordsWithIterator updates records in batches.
-func (s *ObjectUpdateService) RecordsWithIterator(ctx context.Context, params ObjectUpdateRecordsIteratorParams) (BatchResponses, error) {
+func (s *ObjectUpdateService) RecordsWithIterator(ctx context.Context, params ObjectUpdateRecordsIteratorParams) (*BatchOperationResult, error) {
 	total := len(params.Records)
-	if total == 0 {
-		return nil, nil
+
+	// 参数校验
+	if params.Records == nil {
+		s.client.log(LoggerLevelError, "[object.update.recordsWithIterator] Invalid records parameter: must be a non-empty array")
+		return nil, fmt.Errorf("参数 records 必须是一个数组")
 	}
 
-	responses := make(BatchResponses, 0, (total+99)/100)
+	if total == 0 {
+		s.client.log(LoggerLevelWarn, "[object.update.recordsWithIterator] Empty records array provided, returning empty result")
+		return &BatchOperationResult{Total: 0, Success: []OperationItem{}, Failed: []OperationItem{}, SuccessCount: 0, FailedCount: 0}, nil
+	}
 
-	const chunkSize = 100
+	chunkSize := params.Limit
+	if chunkSize <= 0 {
+		chunkSize = 100
+	}
+
+	result := &BatchOperationResult{
+		Total:   total,
+		Success: make([]OperationItem, 0, total),
+		Failed:  make([]OperationItem, 0),
+	}
+
+	s.client.log(LoggerLevelDebug, "[object.update.recordsWithIterator] Chunking %d records into groups of %d", total, chunkSize)
+
 	for index := 0; index < total; index += chunkSize {
 		end := index + chunkSize
 		if end > total {
@@ -525,33 +673,145 @@ func (s *ObjectUpdateService) RecordsWithIterator(ctx context.Context, params Ob
 		chunk := params.Records[index:end]
 		chunkIndex := index/chunkSize + 1
 
-		s.client.log(LoggerLevelDebug, "[object.update.recordsWithIterator] Processing chunk %d: %d records", chunkIndex, len(chunk))
+		s.client.log(LoggerLevelDebug, "[object.update.recordsWithIterator] Processing chunk %d/%d: %d records", chunkIndex, (total+chunkSize-1)/chunkSize, len(chunk))
 
-		var resp *APIResponse
 		err := s.client.limiter.Do(ctx, func() error {
-			if err := s.client.ensureTokenValid(ctx); err != nil {
-				return err
+			resp, err := s.Records(ctx, ObjectUpdateRecordsParams{
+				ObjectName: params.ObjectName,
+				Records:    chunk,
+			})
+
+			if err != nil {
+				s.client.log(LoggerLevelError, "[object.update.recordsWithIterator] Chunk %d threw error: %v", chunkIndex, err)
+				// 整个批次异常，将这批次的所有记录标记为失败
+				for _, record := range chunk {
+					id := "unknown"
+					if idVal, ok := record["_id"]; ok {
+						if idStr, ok := idVal.(string); ok {
+							id = idStr
+						}
+					}
+					result.Failed = append(result.Failed, OperationItem{
+						ID:      id,
+						Success: false,
+						Error:   err.Error(),
+					})
+				}
+				return nil // 继续处理下一批次
 			}
 
-			endpoint := fmt.Sprintf(
-				"/v1/data/namespaces/%s/objects/%s/records_batch",
-				url.PathEscape(s.client.namespace),
-				url.PathEscape(params.ObjectName),
-			)
+			if resp.Code != "0" {
+				s.client.log(LoggerLevelError, "[object.update.recordsWithIterator] Chunk %d failed: code=%s, msg=%s", chunkIndex, resp.Code, resp.Msg)
+				// 整个批次失败，将这批次的所有记录标记为失败
+				for _, record := range chunk {
+					id := "unknown"
+					if idVal, ok := record["_id"]; ok {
+						if idStr, ok := idVal.(string); ok {
+							id = idStr
+						}
+					}
+					errMsg := resp.Msg
+					if errMsg == "" {
+						errMsg = fmt.Sprintf("Update failed with code %s", resp.Code)
+					}
+					result.Failed = append(result.Failed, OperationItem{
+						ID:      id,
+						Success: false,
+						Error:   errMsg,
+					})
+				}
+				return nil // 继续处理下一批次
+			}
 
-			payload := map[string]any{"records": chunk}
-			var err error
-			resp, err = s.client.doJSON(ctx, http.MethodPatch, endpoint, payload, true, nil)
-			return err
+			// 处理响应中的 items
+			var page struct {
+				Items []map[string]any `json:"items"`
+			}
+			if err := resp.DecodeData(&page); err != nil {
+				s.client.log(LoggerLevelError, "[object.update.recordsWithIterator] Failed to decode batch update response: %v", err)
+				for _, record := range chunk {
+					id := "unknown"
+					if idVal, ok := record["_id"]; ok {
+						if idStr, ok := idVal.(string); ok {
+							id = idStr
+						}
+					}
+					result.Failed = append(result.Failed, OperationItem{
+						ID:      id,
+						Success: false,
+						Error:   err.Error(),
+					})
+				}
+				return nil
+			}
+
+			if len(page.Items) > 0 {
+				for _, item := range page.Items {
+					id := "unknown"
+					if idVal, ok := item["_id"]; ok {
+						if idStr, ok := idVal.(string); ok {
+							id = idStr
+						}
+					}
+
+					// Check success field
+					success := false
+					if successVal, ok := item["success"]; ok {
+						if successBool, ok := successVal.(bool); ok {
+							success = successBool
+						}
+					}
+
+					if success {
+						result.Success = append(result.Success, OperationItem{
+							ID:      id,
+							Success: true,
+						})
+					} else {
+						errMsg := ""
+						if errorVal, ok := item["error"]; ok {
+							if errorStr, ok := errorVal.(string); ok {
+								errMsg = errorStr
+							}
+						}
+						result.Failed = append(result.Failed, OperationItem{
+							ID:      id,
+							Success: false,
+							Error:   errMsg,
+						})
+					}
+				}
+			}
+
+			successCount := 0
+			failedCount := 0
+			for _, item := range page.Items {
+				if successVal, ok := item["success"]; ok {
+					if successBool, ok := successVal.(bool); ok && successBool {
+						successCount++
+					} else {
+						failedCount++
+					}
+				}
+			}
+
+			s.client.log(LoggerLevelDebug, "[object.update.recordsWithIterator] Chunk %d completed: %s, success=%d, failed=%d", chunkIndex, params.ObjectName, successCount, failedCount)
+			s.client.log(LoggerLevelTrace, "[object.update.recordsWithIterator] Chunk %d response: %+v", chunkIndex, resp)
+
+			return nil
 		})
+
 		if err != nil {
 			return nil, err
 		}
-
-		responses = append(responses, resp)
 	}
 
-	return responses, nil
+	result.SuccessCount = len(result.Success)
+	result.FailedCount = len(result.Failed)
+
+	s.client.log(LoggerLevelInfo, "[object.update.recordsWithIterator] Update completed: total=%d, success=%d, failed=%d", result.Total, result.SuccessCount, result.FailedCount)
+
+	return result, nil
 }
 
 // Record deletes a single record.
@@ -606,15 +866,33 @@ func (s *ObjectDeleteService) Records(ctx context.Context, params ObjectDeleteRe
 }
 
 // RecordsWithIterator deletes records in batches of 100.
-func (s *ObjectDeleteService) RecordsWithIterator(ctx context.Context, params ObjectDeleteRecordsIteratorParams) (BatchResponses, error) {
+func (s *ObjectDeleteService) RecordsWithIterator(ctx context.Context, params ObjectDeleteRecordsIteratorParams) (*BatchOperationResult, error) {
 	total := len(params.IDs)
-	if total == 0 {
-		return nil, nil
+
+	// 参数校验
+	if params.IDs == nil {
+		s.client.log(LoggerLevelError, "[object.delete.recordsWithIterator] Invalid ids parameter: must be a non-empty array")
+		return nil, fmt.Errorf("参数 ids 必须是一个数组")
 	}
 
-	responses := make(BatchResponses, 0, (total+99)/100)
+	if total == 0 {
+		s.client.log(LoggerLevelWarn, "[object.delete.recordsWithIterator] Empty ids array provided, returning empty result")
+		return &BatchOperationResult{Total: 0, Success: []OperationItem{}, Failed: []OperationItem{}, SuccessCount: 0, FailedCount: 0}, nil
+	}
 
-	const chunkSize = 100
+	chunkSize := params.Limit
+	if chunkSize <= 0 {
+		chunkSize = 100
+	}
+
+	result := &BatchOperationResult{
+		Total:   total,
+		Success: make([]OperationItem, 0, total),
+		Failed:  make([]OperationItem, 0),
+	}
+
+	s.client.log(LoggerLevelDebug, "[object.delete.recordsWithIterator] Chunking %d records into groups of %d", total, chunkSize)
+
 	for index := 0; index < total; index += chunkSize {
 		end := index + chunkSize
 		if end > total {
@@ -625,31 +903,122 @@ func (s *ObjectDeleteService) RecordsWithIterator(ctx context.Context, params Ob
 
 		s.client.log(LoggerLevelInfo, "[object.delete.recordsWithIterator] Processing chunk %d/%d: %d records", chunkIndex, (total+chunkSize-1)/chunkSize, len(chunk))
 
-		var resp *APIResponse
 		err := s.client.limiter.Do(ctx, func() error {
-			if err := s.client.ensureTokenValid(ctx); err != nil {
-				return err
+			resp, err := s.Records(ctx, ObjectDeleteRecordsParams{
+				ObjectName: params.ObjectName,
+				IDs:        chunk,
+			})
+
+			if err != nil {
+				s.client.log(LoggerLevelError, "[object.delete.recordsWithIterator] Chunk %d threw error: %v", chunkIndex, err)
+				// 整个批次异常，将这批次的所有 ID 标记为失败
+				for _, id := range chunk {
+					result.Failed = append(result.Failed, OperationItem{
+						ID:      id,
+						Success: false,
+						Error:   err.Error(),
+					})
+				}
+				return nil // 继续处理下一批次
 			}
 
-			endpoint := fmt.Sprintf(
-				"/v1/data/namespaces/%s/objects/%s/records_batch",
-				url.PathEscape(s.client.namespace),
-				url.PathEscape(params.ObjectName),
-			)
+			if resp.Code != "0" {
+				s.client.log(LoggerLevelError, "[object.delete.recordsWithIterator] Chunk %d failed: code=%s, msg=%s", chunkIndex, resp.Code, resp.Msg)
+				// 整个批次失败，将这批次的所有 ID 标记为失败
+				for _, id := range chunk {
+					errMsg := resp.Msg
+					if errMsg == "" {
+						errMsg = fmt.Sprintf("Delete failed with code %s", resp.Code)
+					}
+					result.Failed = append(result.Failed, OperationItem{
+						ID:      id,
+						Success: false,
+						Error:   errMsg,
+					})
+				}
+				return nil // 继续处理下一批次
+			}
 
-			payload := map[string]any{"ids": chunk}
-			var err error
-			resp, err = s.client.doJSON(ctx, http.MethodDelete, endpoint, payload, true, map[string]string{
-				"Content-Type": "application/json",
-			})
-			return err
+			// 处理响应中的 items
+			var page struct {
+				Items []map[string]any `json:"items"`
+			}
+			if err := resp.DecodeData(&page); err != nil {
+				s.client.log(LoggerLevelError, "[object.delete.recordsWithIterator] Failed to decode batch delete response: %v", err)
+				for _, id := range chunk {
+					result.Failed = append(result.Failed, OperationItem{
+						ID:      id,
+						Success: false,
+						Error:   err.Error(),
+					})
+				}
+				return nil
+			}
+
+			if len(page.Items) > 0 {
+				for _, item := range page.Items {
+					id := "unknown"
+					if idVal, ok := item["_id"]; ok {
+						if idStr, ok := idVal.(string); ok {
+							id = idStr
+						}
+					}
+
+					// Check success field
+					success := false
+					if successVal, ok := item["success"]; ok {
+						if successBool, ok := successVal.(bool); ok {
+							success = successBool
+						}
+					}
+
+					if success {
+						result.Success = append(result.Success, OperationItem{
+							ID:      id,
+							Success: true,
+						})
+					} else {
+						errMsg := ""
+						if errorVal, ok := item["error"]; ok {
+							if errorStr, ok := errorVal.(string); ok {
+								errMsg = errorStr
+							}
+						}
+						result.Failed = append(result.Failed, OperationItem{
+							ID:      id,
+							Success: false,
+							Error:   errMsg,
+						})
+					}
+				}
+			}
+
+			successCount := 0
+			failedCount := 0
+			for _, item := range page.Items {
+				if successVal, ok := item["success"]; ok {
+					if successBool, ok := successVal.(bool); ok && successBool {
+						successCount++
+					} else {
+						failedCount++
+					}
+				}
+			}
+
+			s.client.log(LoggerLevelDebug, "[object.delete.recordsWithIterator] Chunk %d completed: %s, success=%d, failed=%d", chunkIndex, params.ObjectName, successCount, failedCount)
+
+			return nil
 		})
+
 		if err != nil {
 			return nil, err
 		}
-
-		responses = append(responses, resp)
 	}
 
-	return responses, nil
+	result.SuccessCount = len(result.Success)
+	result.FailedCount = len(result.Failed)
+
+	s.client.log(LoggerLevelInfo, "[object.delete.recordsWithIterator] Delete completed: total=%d, success=%d, failed=%d", result.Total, result.SuccessCount, result.FailedCount)
+
+	return result, nil
 }

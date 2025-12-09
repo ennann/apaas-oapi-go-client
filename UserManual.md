@@ -237,19 +237,30 @@ log.Printf("code=%s", res.Code)
 
 ### **批量创建（自动拆分）**
 
+支持超过 100 条数据，SDK 已自动分组限流。返回详细的成功/失败统计。
+
 ```go
 result, err := client.Object.Create.RecordsWithIterator(ctx, apaas.ObjectCreateRecordsIteratorParams{
 	ObjectName: "object_event_log",
 	Records: []map[string]any{
 		{"name": "Sample text 1"},
 		{"name": "Sample text 2"},
-		// ...
+		// ... 可以超过 100 条
 	},
+	Limit: 100, // 可选，默认 100
 })
 if err != nil {
 	log.Fatal(err)
 }
-log.Printf("Total: %d, Created: %d", result.Total, len(result.Items))
+
+fmt.Printf("Total: %d\n", result.Total)
+fmt.Printf("Success: %d\n", result.SuccessCount)
+fmt.Printf("Failed: %d\n", result.FailedCount)
+
+// 查看失败的记录
+for _, failed := range result.Failed {
+	fmt.Printf("Failed ID: %s, Error: %s\n", failed.ID, failed.Error)
+}
 ```
 
 ***
@@ -298,15 +309,30 @@ log.Printf("code=%s", res.Code)
 
 ### **批量更新（自动拆分）**
 
+支持超过 100 条数据，SDK 已自动分组限流。返回详细的成功/失败统计。
+
 ```go
-responses, err := client.Object.Update.RecordsWithIterator(ctx, apaas.ObjectUpdateRecordsIteratorParams{
+result, err := client.Object.Update.RecordsWithIterator(ctx, apaas.ObjectUpdateRecordsIteratorParams{
 	ObjectName: "object_store",
-	Records:    bulkUpdates, // []map[string]any
+	Records: []map[string]any{
+		{"_id": "id1", "field1": "value1"},
+		{"_id": "id2", "field1": "value2"},
+		// ... 可以超过 100 条
+	},
+	Limit: 100, // 可选，默认 100
 })
 if err != nil {
 	log.Fatal(err)
 }
-log.Printf("batches=%d", len(responses))
+
+fmt.Printf("Total: %d\n", result.Total)
+fmt.Printf("Success: %d\n", result.SuccessCount)
+fmt.Printf("Failed: %d\n", result.FailedCount)
+
+// 查看失败的记录
+for _, failed := range result.Failed {
+	fmt.Printf("Failed ID: %s, Error: %s\n", failed.ID, failed.Error)
+}
 ```
 
 ***
@@ -349,15 +375,26 @@ log.Printf("code=%s", res.Code)
 
 ### **批量删除（自动拆分）**
 
+支持超过 100 条数据，SDK 已自动分组限流。返回详细的成功/失败统计。
+
 ```go
-responses, err := client.Object.Delete.RecordsWithIterator(ctx, apaas.ObjectDeleteRecordsIteratorParams{
+result, err := client.Object.Delete.RecordsWithIterator(ctx, apaas.ObjectDeleteRecordsIteratorParams{
 	ObjectName: "object_store",
-	IDs:        ids, // []string
+	IDs:        []string{"id1", "id2", "id3", /* ... 可以超过 100 个 */},
+	Limit:      100, // 可选，默认 100
 })
 if err != nil {
 	log.Fatal(err)
 }
-log.Printf("batches=%d", len(responses))
+
+fmt.Printf("Total: %d\n", result.Total)
+fmt.Printf("Success: %d\n", result.SuccessCount)
+fmt.Printf("Failed: %d\n", result.FailedCount)
+
+// 查看失败的记录
+for _, failed := range result.Failed {
+	fmt.Printf("Failed ID: %s, Error: %s\n", failed.ID, failed.Error)
+}
 ```
 
 ***

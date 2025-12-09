@@ -168,7 +168,15 @@ func batchOperations(client *apaas.Client) {
 
 	log.Printf("✓ Batch creation completed")
 	log.Printf("  Total records: %d", result.Total)
-	log.Printf("  Created: %d records", len(result.Items))
+	log.Printf("  Success: %d", result.SuccessCount)
+	log.Printf("  Failed: %d", result.FailedCount)
+
+	if result.FailedCount > 0 {
+		log.Printf("  Failed records:")
+		for _, failed := range result.Failed {
+			log.Printf("    ID: %s, Error: %s", failed.ID, failed.Error)
+		}
+	}
 }
 
 func handleError(operation string, err error) {

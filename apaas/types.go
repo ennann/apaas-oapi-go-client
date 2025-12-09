@@ -45,6 +45,22 @@ type RecordsIteratorResult struct {
 	Items []map[string]any `json:"items"`
 }
 
+// BatchOperationResult 批量操作结果（创建/更新/删除）
+type BatchOperationResult struct {
+	Total        int             `json:"total"`
+	Success      []OperationItem `json:"success"`
+	Failed       []OperationItem `json:"failed"`
+	SuccessCount int             `json:"successCount"`
+	FailedCount  int             `json:"failedCount"`
+}
+
+// OperationItem 操作项（成功或失败）
+type OperationItem struct {
+	ID      string `json:"_id"`
+	Success bool   `json:"success"`
+	Error   string `json:"error,omitempty"`
+}
+
 // BatchResponses groups multiple API responses.
 type BatchResponses []*APIResponse
 
